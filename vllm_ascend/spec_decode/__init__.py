@@ -34,7 +34,7 @@ def get_spec_decode_method(method, vllm_config, device, runner):
         return AscendSuffixDecodingProposer(vllm_config, runner)
     elif method == "medusa":
         return AscendMedusaProposer(vllm_config, device)
-    elif method in ("eagle", "eagle3", "mtp"):
+    elif method in ("eagle", "eagle3", "mtp", "mimo_mtp", "ernie_mtp"):
         return AscendEagleProposer(vllm_config, device, runner)
     elif method == "dflash":
         if not vllm_version_is("0.19.1"):
