@@ -879,6 +879,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     model_kwargs["positions"] = model_positions
 
         ret_hidden_states = self.model(**model_kwargs)
+        # Synchronize NPU after draft model forward to prevent race conditions
+        # in subsequent stream operations (e.g., AsyncGPUModelRunnerOutput).
+        torch.npu.synchronize()
         if not self.model_returns_tuple():
             last_hidden_states = ret_hidden_states
             hidden_states = last_hidden_states
@@ -1631,6 +1634,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 num_reqs,
                 BLOCK_SIZE=_PREPARE_INPUTS_BLOCK_SIZE,
             )
+            # Synchronize after async Triton kernel to ensure outputs are ready.
+            torch.npu.synchronize()
         else:
             num_draft_tokens_gpu = torch.cat(
                 [

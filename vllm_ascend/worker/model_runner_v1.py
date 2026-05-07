@@ -18,7 +18,6 @@
 #
 
 import math
-import sys
 import time
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
@@ -28,6 +27,7 @@ from functools import partial
 from multiprocessing import Manager
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias
 
+import sys
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -900,7 +900,7 @@ class NPUModelRunner(GPUModelRunner):
             self.prev_positions.copy_to_gpu(num_reqs)
             self.prev_num_draft_tokens.copy_to_gpu()
             cpu_values = self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs].to(
-                device=self.device, non_blocking=True
+                device=self.device, non_blocking=False
             )
             update_num_computed_tokens_for_batch_change(
                 self.num_computed_tokens,
@@ -915,6 +915,7 @@ class NPUModelRunner(GPUModelRunner):
                 self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
                 non_blocking=True,
             )
+
 
         self.req_indices.np[:total_num_scheduled_tokens] = req_indices
         self.req_indices.copy_to_gpu(total_num_scheduled_tokens)
@@ -951,21 +952,19 @@ class NPUModelRunner(GPUModelRunner):
         # correct but optimistic_seq_lens_cpu is stale (it assumed all drafts
         # were accepted). Sync the corrected values back to CPU so that NPU
         # attention backends (which use _seq_lens_cpu) get the right values.
-        # Use non_blocking copy to pinned memory and record an event;
-        # _build_attention_metadata will synchronize before reading.
-        if (
-            self._needs_seq_lens_cpu_sync
-            and self.use_async_spec_decode
-            and self.valid_sampled_token_count_gpu is not None
-            and prev_req_id_to_index
-        ):
+        # On Ascend NPU, use blocking copy because async D2H copy_ with
+        # pinned memory is unreliable.
+        needs_sync = (self._needs_seq_lens_cpu_sync and self.use_async_spec_decode
+                      and self.valid_sampled_token_count_gpu is not None
+                      and bool(prev_req_id_to_index))
+        if needs_sync:
             self.optimistic_seq_lens_cpu[:num_reqs].copy_(
-                self.seq_lens[:num_reqs], non_blocking=True
+                self.seq_lens[:num_reqs], non_blocking=False
             )
-            if self._seq_lens_cpu_event is None:
-                self._seq_lens_cpu_event = torch.npu.Event()
-            self._seq_lens_cpu_event.record()
-            self._seq_lens_cpu_event_pending = True
+            # On Ascend NPU, non_blocking=False copy_ already synchronizes
+            # the stream, so seq_lens data is guaranteed on CPU. No event
+            # needed — skip record() which hangs on Ascend.
+            self._seq_lens_cpu_event_pending = False
         else:
             self._seq_lens_cpu_event_pending = False
 
@@ -982,7 +981,7 @@ class NPUModelRunner(GPUModelRunner):
             drift = self.num_computed_tokens[req_indices_gpu].to(
                 torch.int64
             ) - self.input_batch.num_computed_tokens_cpu_tensor[req_indices].to(
-                device=self.device, dtype=torch.int64, non_blocking=True
+                device=self.device, dtype=torch.int64, non_blocking=False
             )
             target = self.mrope_positions if self.uses_mrope else self.xdrope_positions
             target.gpu[:, :total_num_scheduled_tokens] += drift
@@ -999,7 +998,7 @@ class NPUModelRunner(GPUModelRunner):
             num_sampled_tokens = np.ones(num_reqs, dtype=np.int32)
             if self.use_cp:
                 logits_indices = self.pcp_manager.get_logits_indices(cu_num_tokens, num_reqs, tokens_original)
-                logits_indices = logits_indices.pin_memory().to(self.device, non_blocking=True)
+                logits_indices = logits_indices.pin_memory().to(self.device, non_blocking=False)
             else:
                 logits_indices = self.query_start_loc.gpu[1 : num_reqs + 1] - 1
         else:
@@ -1235,7 +1234,7 @@ class NPUModelRunner(GPUModelRunner):
             cu_num_scheduled_tokens = cu_num_scheduled_tokens * self.pcp_size - num_pcp_pads
             logits_indices_pcp = np.repeat(cu_num_scheduled_tokens - num_sampled_tokens, num_sampled_tokens)
             logits_indices_pcp += self._arange_scratch[: cu_num_sampled_tokens[-1]]
-            logits_indices_pcp = torch.from_numpy(logits_indices_pcp).pin_memory().to(self.device, non_blocking=True)
+            logits_indices_pcp = torch.from_numpy(logits_indices_pcp).pin_memory().to(self.device, non_blocking=False)
 
         # Compute the bonus logits indices.
         bonus_logits_indices = cu_num_sampled_tokens - 1
@@ -1254,11 +1253,11 @@ class NPUModelRunner(GPUModelRunner):
         target_logits_indices += arange
 
         # TODO: Optimize the CPU -> NPU copy.
-        cu_num_draft_tokens = torch.from_numpy(cu_num_draft_tokens).pin_memory().to(self.device, non_blocking=True)
-        cu_num_sampled_tokens = torch.from_numpy(cu_num_sampled_tokens).pin_memory().to(self.device, non_blocking=True)
-        logits_indices = torch.from_numpy(logits_indices).pin_memory().to(self.device, non_blocking=True)
-        target_logits_indices = torch.from_numpy(target_logits_indices).pin_memory().to(self.device, non_blocking=True)
-        bonus_logits_indices = torch.from_numpy(bonus_logits_indices).pin_memory().to(self.device, non_blocking=True)
+        cu_num_draft_tokens = torch.from_numpy(cu_num_draft_tokens).pin_memory().to(self.device, non_blocking=False)
+        cu_num_sampled_tokens = torch.from_numpy(cu_num_sampled_tokens).pin_memory().to(self.device, non_blocking=False)
+        logits_indices = torch.from_numpy(logits_indices).pin_memory().to(self.device, non_blocking=False)
+        target_logits_indices = torch.from_numpy(target_logits_indices).pin_memory().to(self.device, non_blocking=False)
+        bonus_logits_indices = torch.from_numpy(bonus_logits_indices).pin_memory().to(self.device, non_blocking=False)
 
         # Compute the draft token ids.
         # draft_token_indices:      [  1,   2,   3, 105, 106, 208]
@@ -1282,15 +1281,15 @@ class NPUModelRunner(GPUModelRunner):
         if self.valid_sampled_token_count_event is None:
             return
 
-        # Initialize a new stream to overlap the copy operation with
-        # prepare_input of draft model.
-        with torch.npu.stream(self.valid_sampled_token_count_copy_stream):  
-            self.valid_sampled_token_count_copy_stream.wait_stream(torch.npu.current_stream())  
-            counts = valid_sampled_tokens_count
-            counts_cpu = self.valid_sampled_token_count_cpu
-            assert counts_cpu is not None
-            counts_cpu[: counts.shape[0]].copy_(counts, non_blocking=True)
-            self.valid_sampled_token_count_event.record()
+        # On Ascend NPU, async GPU→CPU copy with non_blocking=True on pinned
+        # memory is unreliable, and torch.npu.Event().record() hangs.
+        # Use blocking copy instead, which implicitly synchronizes the stream.
+        counts = valid_sampled_tokens_count
+        counts_cpu = self.valid_sampled_token_count_cpu
+        assert counts_cpu is not None
+        counts_cpu[: counts.shape[0]].copy_(counts, non_blocking=False)
+        # Blocking copy already syncs the stream — data is guaranteed on CPU.
+        # No event.record() needed (it hangs on Ascend NPU).
 
         if self.use_async_spec_decode:
             # Stash for GPU-side correction in _prepare_inputs.
@@ -1312,6 +1311,7 @@ class NPUModelRunner(GPUModelRunner):
         sample_hidden_states: torch.Tensor = None,
         target_model_batch_desc: BatchDescriptor = None,
     ) -> list[list[int]] | None:
+        has_meta = spec_decode_metadata is not None
         if not self.drafter:
             # Speculative decoding is not enabled.
             draft_token_ids = None
@@ -1404,6 +1404,8 @@ class NPUModelRunner(GPUModelRunner):
                     )
                 else:
                     assert self.drafter is not None
+                    # Sync before prepare_inputs_padded to avoid Triton kernel race.
+                    torch.npu.synchronize()
                     common_attn_metadata, token_indices, token_indices_to_sample, num_rejected_tokens_gpu = (
                         self.drafter.prepare_inputs_padded(
                             common_attn_metadata, spec_decode_metadata, valid_sampled_tokens_count
@@ -1451,6 +1453,8 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        total_tokens = scheduler_output.total_num_scheduled_tokens
+        num_reqs = len(scheduler_output.num_scheduled_tokens)
         if self.vllm_config.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
             if capturer is not None:
@@ -1695,6 +1699,8 @@ class NPUModelRunner(GPUModelRunner):
         has_encoder_input = self.model_config.is_encoder_decoder and num_encoder_reqs > 0
 
         # Run forward pass
+        import torch
+        torch.npu.synchronize()
         clear_kv_metadata = self.speculative_config is None
         with (
             record_function_or_nullcontext("forward"),
@@ -1827,6 +1833,10 @@ class NPUModelRunner(GPUModelRunner):
             output.kv_connector_output = kv_connector_output
             return output
 
+        if self.speculative_config is not None:
+            # Ensure all previous NPU ops complete before MTP path.
+            torch.npu.synchronize()
+
         # Unpack ephemeral state.
         (
             scheduler_output,
@@ -1858,11 +1868,11 @@ class NPUModelRunner(GPUModelRunner):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
         if self.need_accepted_tokens:
-            if self.sampling_done_event is None:
-                self.sampling_done_event = torch.npu.Event()
-
-            assert self.sampling_done_event is not None
-            self.sampling_done_event.record()
+            # On Ascend NPU, torch.npu.Event().record() hangs on newly
+            # created events. Use torch.npu.synchronize() instead at
+            # the wait point to guarantee sampling is done before
+            # _update_states_after_model_execute.
+            pass
 
         self.valid_sampled_token_count_gpu: torch.Tensor | None = None # type: ignore[no-redef]
 
@@ -1952,12 +1962,13 @@ class NPUModelRunner(GPUModelRunner):
             self.debugger.step()
 
         if self.need_accepted_tokens:
-            assert self.sampling_done_event is not None
+            # On Ascend NPU, event.record() hangs on newly created events,
+            # so we use device synchronize instead of event wait.
+            torch.npu.synchronize()
             with (
                 record_function_or_nullcontext("async_state_update"),
                 torch.npu.stream(global_stream()),
             ):
-                global_stream().wait_event(self.sampling_done_event)
                 self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
 
         # In async scheduling + PP, broadcast sampled token ids from the
@@ -1970,6 +1981,10 @@ class NPUModelRunner(GPUModelRunner):
 
         if not self.use_async_scheduling:
             return model_runner_output
+        if self.speculative_config is not None:
+            # Synchronize NPU to ensure draft model operations complete
+            # before stream switching in AsyncGPUModelRunnerOutput.
+            torch.npu.synchronize()
         async_output = AsyncGPUModelRunnerOutput(
             model_runner_output=model_runner_output,
             sampled_token_ids=sampler_output.sampled_token_ids,
@@ -2575,11 +2590,10 @@ class NPUModelRunner(GPUModelRunner):
             if kv_cache_gid > 0:
                 cm.block_table_tensor, cm.slot_mapping = _get_block_table_and_slot_mapping(kv_cache_gid)
             if self.speculative_config and spec_decode_common_attn_metadata is None:
-                if isinstance(self.drafter, AscendEagleProposer | AscendDraftModelProposer | AscendDflashProposer):
-                    if self.drafter.attn_layer_names[0] in kv_cache_group.layer_names:
-                        spec_decode_common_attn_metadata = cm
-                else:
-                    spec_decode_common_attn_metadata = cm
+                # Always capture cm for the draft path so sample_tokens has
+                # valid metadata, but do NOT let use_spec_decode affect the
+                # builder (it hangs the model forward on Ascend NPU).
+                spec_decode_common_attn_metadata = cm
             if self.enable_hamming_sparse is True:
                 from vllm_ascend.attention.kvcomp_attn.attention_utils import build_kvcomp_metadata
                 build_kvcomp_metadata(self.kvcomp_meta_data, cm)
@@ -3835,9 +3849,12 @@ def _torch_cuda_wrapper():
         torch.cuda.mem_get_info = _StreamPlaceholder
         raise RuntimeError(f"NPUModelRunner init failed, error is {e}")
     finally:
-        # if anything goes wrong, just patch it with a placeholder
-        torch.cuda.Event = _EventPlaceholder
-        torch.cuda.Stream = torch.cuda.Stream
+        # Keep torch.cuda mappings pointing to real NPU implementations.
+        # torch.Event must also be mapped for upstream code that uses
+        # torch.Event() (not torch.cuda.Event()), e.g. AsyncGPUModelRunnerOutput.
+        torch.Event = torch.npu.Event
+        torch.cuda.Event = torch.npu.Event
+        torch.cuda.Stream = torch.npu.Stream
         torch.cuda.default_stream = torch.npu.default_stream
         torch.cuda.current_stream = torch.npu.current_stream
         torch.cuda.stream = torch.npu.stream

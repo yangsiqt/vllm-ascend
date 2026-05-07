@@ -27,5 +27,8 @@ def update_num_computed_tokens_for_batch_change(
     corrected = prev_computed + valid_counts.int()
 
     n = prev_positions.shape[0]
+    # Use intermediate tensor to avoid reading num_accepted_tokens while
+    # writing to it in the same copy_() call (Ascend NPU quirk).
     num_computed_tokens[:n].copy_(torch.where(participating, corrected, cpu_num_computed_tokens))
-    num_accepted_tokens.copy_(torch.where(participating, valid_counts, num_accepted_tokens))
+    na_result = torch.where(participating, valid_counts, num_accepted_tokens)
+    num_accepted_tokens.copy_(na_result)
