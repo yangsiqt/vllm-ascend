@@ -1404,8 +1404,6 @@ class NPUModelRunner(GPUModelRunner):
                     )
                 else:
                     assert self.drafter is not None
-                    # Sync before prepare_inputs_padded to avoid Triton kernel race.
-                    torch.npu.synchronize()
                     common_attn_metadata, token_indices, token_indices_to_sample, num_rejected_tokens_gpu = (
                         self.drafter.prepare_inputs_padded(
                             common_attn_metadata, spec_decode_metadata, valid_sampled_tokens_count
@@ -1699,8 +1697,6 @@ class NPUModelRunner(GPUModelRunner):
         has_encoder_input = self.model_config.is_encoder_decoder and num_encoder_reqs > 0
 
         # Run forward pass
-        import torch
-        torch.npu.synchronize()
         clear_kv_metadata = self.speculative_config is None
         with (
             record_function_or_nullcontext("forward"),
@@ -1832,10 +1828,6 @@ class NPUModelRunner(GPUModelRunner):
             output = copy(EMPTY_MODEL_RUNNER_OUTPUT)
             output.kv_connector_output = kv_connector_output
             return output
-
-        if self.speculative_config is not None:
-            # Ensure all previous NPU ops complete before MTP path.
-            torch.npu.synchronize()
 
         # Unpack ephemeral state.
         (
@@ -1981,10 +1973,6 @@ class NPUModelRunner(GPUModelRunner):
 
         if not self.use_async_scheduling:
             return model_runner_output
-        if self.speculative_config is not None:
-            # Synchronize NPU to ensure draft model operations complete
-            # before stream switching in AsyncGPUModelRunnerOutput.
-            torch.npu.synchronize()
         async_output = AsyncGPUModelRunnerOutput(
             model_runner_output=model_runner_output,
             sampled_token_ids=sampler_output.sampled_token_ids,
