@@ -96,21 +96,75 @@
 - **使用** `assert inputs_embeds is not None` 避免 None 检查导致的图断裂
 - 保持与上游类相同的 forward 签名
 
-## 限制与后续
+## Commit 2: async_scheduling NPU 修复
 
-- 完整端到端推理测试需要修复 Triton-Ascend 驱动激活问题 (预置环境问题，非代码问题)
-- MiMo-7B-Base 模型已通过 ModelScope 下载完成 (14.9GB, 4分片)
-- Ernie4.5-MoE 模型未公开发布，需要华为内部获取
+commit `920705c88`
+
+MTP + `async_scheduling=True` (V1 默认) 在 Ascend NPU 上 hang，根因是三个 NPU 不兼容：
+
+### 2.1 H2D 异步拷贝 hang
+`pin_memory().to(device, non_blocking=True)` 在 NPU 上 hang，改为 `non_blocking=False`（7 处）。
+
+### 2.2 torch.npu.Event().record() hang
+新创建的 `Event.record()` 在 NPU 上 hang。替代方案：
+- 阻塞拷贝（`non_blocking=False`）隐式同步 → 无需 event
+- `torch.npu.synchronize()` 替代 event wait
+
+### 2.3 copy_ 源/目标重叠
+`tensor.copy_(torch.where(condition, values, tensor))` 在 NPU 上源和目标不能重叠。拆为中间张量。
+
+### 修改文件
+- `eagle_proposer.py`: H2D 拷贝 `non_blocking=False`，Triton kernel 后加 sync
+- `model_runner_v1.py`: 7 处 `non_blocking=False`，event→sync，seq_lens 阻塞拷贝，attention metadata 修复
+- `utils.py`: copy_ 中间张量
+
+## Commit 3: 冗余 sync 点移除
+
+commit `214515e98`
+
+Commit 2 通过阻塞拷贝和 sync 机制保证数据同步后，5 个防御性 `torch.npu.synchronize()` 变为冗余：
+
+| 位置 | 原因 |
+|------|------|
+| eagle_proposer: draft forward 后 | 阻塞拷贝已保证数据就绪 |
+| model_runner: prepare_inputs 前 | 同上 |
+| model_runner: forward 前 | NPU 上此前操作均为同步 |
+| model_runner: MTP unpack 前 | forward 是同步的 |
+| model_runner: AsyncOutput 前 | 阻塞拷贝隐式同步 |
+
+## 验证结果
+
+### 功能验证
+| 验证项 | 状态 |
+|--------|------|
+| import 链 | ✅ |
+| 引擎初始化 | ✅ |
+| MTP n=1 推理 | ✅ |
+| MTP n=2 推理 | ✅ (n=2 比 n=1 慢, 见性能数据) |
+| 离线 API (llm.generate) | ✅ |
+| 在线 API (server) | ✅ |
+| Non-MTP baseline | ✅ |
+| temperature=0 确定性 | ✅ |
+
+### 性能数据 (MiMo-7B-Base, Ascend NPU)
+
+| 场景 | non-MTP | MTP n=1 | 加速比 |
+|------|---------|---------|--------|
+| 4p×256t | 238 tok/s | 323 tok/s | **+35.4%** |
+| 2p×1024t | 128 tok/s | 204 tok/s | **+59.4%** |
+| AIME (10p, ~4000t) | — | 760 tok/s (离线批量) | — |
+
+### MTP n=2 vs n=1
+
+n=2 第二个 draft token 接受率仅 18.8%，导致总吞吐低于 n=1（197 vs 204 tok/s）。MiMo-7B 最优配置为 `num_spec=1`。
+
+### 外部修复
+
+vllm upstream `gpu_input_batch.py`: `async_copy_ready_event` 兼容非 CUDA 平台（Ascend 设为 None，需要跳过 event synchronize）。
+
+## 限制
+
+- MiMo-7B-Base 模型通过 ModelScope 下载 (14.9GB, 4分片)
+- Ernie4.5-MoE 模型未公开发布，需华为内部获取（代码已适配，import 验证通过）
+- `repetition_penalty` / `presence_penalty` 需配合 upstream gpu_input_batch.py 修复使用
 - `--attention-config` 任务 (难度:高) 待开发
-
-## 提交信息
-
-```bash
-git commit -s -m "feat(spec_decode): add Ascend NPU support for mimo_mtp and ernie_mtp"
-
-- Add AscendMiMoMultiTokenPredictorLayer and AscendErnieMultiTokenPredictorLayer
-  with NPU-safe torch.where masking
-- Register patches in patch/worker/__init__.py
-- Route mimo_mtp and ernie_mtp to AscendEagleProposer in spec_decode/__init__.py
-- Follows existing Ascend patch pattern (cf. patch_deepseek_mtp.py)
-```

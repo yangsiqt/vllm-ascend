@@ -24,13 +24,21 @@
 
 ## 任务状态
 
-### 任务1: --speculative-config → mimo_mtp/ernie_mtp (✅ 代码完成，未提交)
+### 任务1: --speculative-config → mimo_mtp/ernie_mtp (✅ 已完成，3 commits)
 - 详见 [SKILL.md](SKILL.md)
-- 变更文件:
+- 3 commits on `feat/speculative-config-mtp`:
+  1. `2166e4511` feat: mimo_mtp/ernie_mtp core adaptation
+  2. `920705c88` fix: MTP + async_scheduling on Ascend NPU
+  3. `214515e98` fix: remove defensive sync points
+- 变更文件 (9 files, +341/-50):
   - `vllm_ascend/patch/worker/patch_mimo_mtp.py` (新增)
   - `vllm_ascend/patch/worker/patch_ernie_mtp.py` (新增)
   - `vllm_ascend/patch/worker/__init__.py` (修改)
   - `vllm_ascend/spec_decode/__init__.py` (修改)
+  - `vllm_ascend/spec_decode/eagle_proposer.py` (修改)
+  - `vllm_ascend/spec_decode/utils.py` (修改)
+  - `vllm_ascend/worker/model_runner_v1.py` (修改)
+- 性能: MTP n=1 +35%~+59% vs non-MTP
 
 ### 任务2: --attention-config → use_prefill_query_quantization (🔴 未开始)
 - 难度: 高
