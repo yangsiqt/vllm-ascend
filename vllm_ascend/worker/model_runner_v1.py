@@ -18,6 +18,7 @@
 #
 
 import math
+import sys
 import time
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
@@ -27,7 +28,6 @@ from functools import partial
 from multiprocessing import Manager
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias
 
-import sys
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -1311,7 +1311,6 @@ class NPUModelRunner(GPUModelRunner):
         sample_hidden_states: torch.Tensor = None,
         target_model_batch_desc: BatchDescriptor = None,
     ) -> list[list[int]] | None:
-        has_meta = spec_decode_metadata is not None
         if not self.drafter:
             # Speculative decoding is not enabled.
             draft_token_ids = None
@@ -1451,8 +1450,6 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
-        total_tokens = scheduler_output.total_num_scheduled_tokens
-        num_reqs = len(scheduler_output.num_scheduled_tokens)
         if self.vllm_config.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
             if capturer is not None:

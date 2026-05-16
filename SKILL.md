@@ -4,12 +4,12 @@
 
 - **比赛**: CCF开源创新大赛 — vLLM Ascend
 - **团队**: 前进4
-- **任务1**: `--speculative-config` 参数 → `method` 子参数 → `mimo_mtp`、`ernie_mtp` 的 Ascend NPU 适配
-- **任务2**: `--attention-config` 参数 → `use_prefill_query_quantization` 子参数 (待开发)
+- **任务**: `--speculative-config` 参数 → `method` 子参数 → `mimo_mtp`、`ernie_mtp` 的 Ascend NPU 适配与验证
 
 ## AI 工具使用方式
 
-本项目使用 **Claude Code** (通过 VS Code 扩展) 进行 AI 辅助开发。关键使用模式:
+本项目使用 **Claude Code** (通过 VS Code 扩展) 进行主要 AI 辅助开发，并使用
+**Codex** 进行最终代码 review、lint 修复和最终复测。关键使用模式:
 
 ### 1. 代码分析与理解
 
@@ -39,7 +39,9 @@
 - Import 链验证: 确认所有模块可导入
 - Monkey-patch 验证: 确认类替换正确生效
 - 引擎初始化验证: 使用 `--load-format dummy` 验证到 LLM 引擎初始化阶段
-- Pre-commit CI: 代码风格和基础检查
+- 端到端推理验证: `llm.generate`、`vllm serve`、non-MTP baseline、MTP n=1/n=2
+- 代码质量检查: `ruff check`、`ruff format --check`、`py_compile`、`git diff --check`
+- 最终性能复测: 使用最终代码运行 `/data/bench_final.py`
 
 ## 代码改动说明
 
@@ -148,23 +150,41 @@ Commit 2 通过阻塞拷贝和 sync 机制保证数据同步后，5 个防御性
 
 ### 性能数据 (MiMo-7B-Base, Ascend NPU)
 
-| 场景 | non-MTP | MTP n=1 | 加速比 |
-|------|---------|---------|--------|
-| 4p×256t | 238 tok/s | 323 tok/s | **+35.4%** |
-| 2p×1024t | 128 tok/s | 204 tok/s | **+59.4%** |
-| AIME (10p, ~4000t) | — | 760 tok/s (离线批量) | — |
+最终复测日期: 2026-05-16。测试命令: `/data/bench_final.py`。
+
+| 场景 | non-MTP | MTP n=1 | MTP n=2 | n=1 加速 | n=2 加速 | 一致性 |
+|------|--------:|--------:|--------:|---------:|---------:|:------:|
+| 1p × 64t | 65 tok/s | 91 tok/s | 84 tok/s | **+39.7%** | +27.9% | 100% |
+| 1p × 256t | 65 tok/s | 94 tok/s | 90 tok/s | **+44.8%** | +38.1% | 100% |
+| 1p × 512t | 65 tok/s | 100 tok/s | 96 tok/s | **+53.0%** | +47.2% | 100% |
+| 1p × 1024t | 66 tok/s | 101 tok/s | 98 tok/s | **+54.1%** | +49.6% | 100% |
+| 2p × 256t | 124 tok/s | 185 tok/s | 175 tok/s | **+49.6%** | +41.3% | 100% |
+| 2p × 1024t | 125 tok/s | 200 tok/s | 192 tok/s | **+60.2%** | +53.8% | 100% |
+| 4p × 256t | 248 tok/s | 351 tok/s | 346 tok/s | **+41.6%** | +39.5% | 100% |
+| 4p × 512t | 240 tok/s | 367 tok/s | 362 tok/s | **+52.9%** | +50.8% | 100% |
 
 ### MTP n=2 vs n=1
 
-n=2 第二个 draft token 接受率仅 18.8%，导致总吞吐低于 n=1（197 vs 204 tok/s）。MiMo-7B 最优配置为 `num_spec=1`。
+n=2 第二个 draft token 接受率较低，导致多数场景总吞吐低于 n=1。MiMo-7B
+推荐配置为 `num_speculative_tokens=1`。
+
+### 最终代码质量检查
+
+Codex 最终 review 后补充了 lint 收尾修复，并完成以下检查:
+
+- `ruff check`: 通过
+- `ruff format --check`: 通过
+- `py_compile`: 通过
+- `git diff --check`: 通过
+- MTP + async + `logprobs=1`: 通过
 
 ### 外部修复
 
-vllm upstream `gpu_input_batch.py`: `async_copy_ready_event` 兼容非 CUDA 平台（Ascend 设为 None，需要跳过 event synchronize）。
+vLLM upstream 的 async output/logprobs 兼容性修复建议单独提交到 vLLM。比赛主
+交付聚焦 vllm-ascend 仓库中的 MTP 适配代码与 `SKILL.md`。
 
 ## 限制
 
 - MiMo-7B-Base 模型通过 ModelScope 下载 (14.9GB, 4分片)
 - Ernie4.5-MoE 模型未公开发布，需华为内部获取（代码已适配，import 验证通过）
-- `repetition_penalty` / `presence_penalty` 需配合 upstream gpu_input_batch.py 修复使用
-- `--attention-config` 任务 (难度:高) 待开发
+- `repetition_penalty` / `presence_penalty` 等 async output 相关场景建议配合 vLLM upstream 兼容性修复使用
