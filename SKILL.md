@@ -40,6 +40,7 @@
 - Monkey-patch 验证: 确认类替换正确生效
 - 引擎初始化验证: 使用 `--load-format dummy` 验证到 LLM 引擎初始化阶段
 - 端到端推理验证: `llm.generate`、`vllm serve`、non-MTP baseline、MTP n=1/n=2
+- ERNIE-4.5-21B-A3B-PT 验证: non-MTP 和 MTP n=1 均完成端到端生成，并完成 4 prompt x 256 tokens 性能对比
 - 代码质量检查: `ruff check`、`ruff format --check`、`py_compile`、`git diff --check`
 - 最终性能复测: 使用最终代码运行 `/data/bench_final.py`
 
@@ -79,6 +80,18 @@
   # After:  elif method in ("eagle", "eagle3", "mtp", "mimo_mtp", "ernie_mtp"):
   ```
 - 原因: 上游 vLLM 将所有特定 MTP 类型规范化为 `method="mtp"`，但在到达 `spec_decode` 路由之前，`mimo_mtp`/`ernie_mtp` 仍以原始名称传递。`get_spec_decode_method()` 需要识别这些原始名称并路由到 `AscendEagleProposer`。
+
+#### 5. `vllm_ascend/device/device_op.py`
+
+- ERNIE-4.5 MoE 在 Ascend 910B 上会触发 `MoeGatingTopK renorm=1` 不支持。
+- 处理方式: 算子侧使用 `renorm=0`，随后对 top-k 权重手动归一化，保持语义一致。
+- `MoeInitRoutingCustom` 在当前 910B 环境中没有可用 binary，改用 `torch_npu.npu_moe_init_routing_v2`。
+
+#### 6. `vllm_ascend/ops/layernorm.py`
+
+- ERNIE 默认路径会调用 `AddRmsNormBias` 自定义算子，但当前 910B CANN 环境不支持该 op。
+- 增加受控 fallback: 仅当错误明确为 `AddRmsNormBias` 不支持当前 SoC 时，退回 `torch_npu.npu_add_rms_norm`，再手动加 bias。
+- 该修复使 ERNIE non-MTP 和 ERNIE MTP n=1 均可在不设置 `VLLM_BATCH_INVARIANT=1` 的默认路径下运行。
 
 ## 技术要点
 
@@ -168,6 +181,27 @@ Commit 2 通过阻塞拷贝和 sync 机制保证数据同步后，5 个防御性
 n=2 第二个 draft token 接受率较低，导致多数场景总吞吐低于 n=1。MiMo-7B
 推荐配置为 `num_speculative_tokens=1`。
 
+### ERNIE-4.5-21B-A3B-PT 补充验证
+
+验证环境: Ascend 910B 64GB 单卡，`enforce_eager=True`，不设置 `VLLM_BATCH_INVARIANT=1`。
+
+| 验证项 | 状态 |
+|--------|------|
+| ERNIE non-MTP 生成 | ✅ |
+| ERNIE MTP n=1 生成 | ✅ |
+| target 架构识别为 `Ernie4_5_MoeForCausalLM` | ✅ |
+| draft 架构识别为 `ErnieMTPModel` | ✅ |
+| MTP embedding/lm_head 共享日志 | ✅ |
+
+4 prompt x 256 tokens 性能对比:
+
+| 场景 | output_tps | total_tps | 说明 |
+|------|-----------:|----------:|------|
+| ERNIE non-MTP | 55.0610 | 57.8033 | 1024 output tokens |
+| ERNIE MTP n=1 | 79.1647 | 83.1074 | 1024 output tokens |
+
+ERNIE MTP n=1 相比 non-MTP 的输出吞吐提升为 **+43.8%**。由于 ERNIE-4.5-21B-A3B-PT 配置中 `num_nextn_predict_layers=1`，推荐验证配置为 `num_speculative_tokens=1`。
+
 ### 最终代码质量检查
 
 Codex 最终 review 后补充了 lint 收尾修复，并完成以下检查:
@@ -186,5 +220,5 @@ vLLM upstream 的 async output/logprobs 兼容性修复建议单独提交到 vLL
 ## 限制
 
 - MiMo-7B-Base 模型通过 ModelScope 下载 (14.9GB, 4分片)
-- Ernie4.5-MoE 模型未公开发布，需华为内部获取（代码已适配，import 验证通过）
+- ERNIE-4.5-21B-A3B-PT 已完成 non-MTP 与 MTP n=1 验证；n=2 不作为推荐配置，因为该模型配置中 `num_nextn_predict_layers=1`
 - `repetition_penalty` / `presence_penalty` 等 async output 相关场景建议配合 vLLM upstream 兼容性修复使用

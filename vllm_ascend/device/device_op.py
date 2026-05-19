@@ -46,7 +46,7 @@ class BaseDeviceAdaptor:
         active_expert_range=None,
         quant_mode: int = -1,
     ):
-        return torch.ops._C_ascend.npu_moe_init_routing_custom(
+        return torch_npu.npu_moe_init_routing_v2(
             hidden_states,
             topk_ids,
             scale=scale,
@@ -77,19 +77,25 @@ class BaseDeviceAdaptor:
         eps: float = 1e-20,
         bias_opt: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Some Ascend 910B CANN builds only support renorm=0 in
+        # MoeGatingTopK. Keep the fused top-k path and apply the softmax
+        # top-k renormalization explicitly afterwards.
+        op_renorm = 0 if norm_type == 0 and renorm == 1 else renorm
         topk_weights, topk_ids, out = torch.ops._C_ascend.moe_gating_top_k(
             x,
             k=k,
             k_group=k_group,
             group_count=group_count,
             group_select_mode=group_select_mode,
-            renorm=renorm,
+            renorm=op_renorm,
             norm_type=norm_type,
             out_flag=out_flag,
             routed_scaling_factor=routed_scaling_factor,
             eps=eps,
             bias_opt=bias_opt,
         )
+        if norm_type == 0 and renorm == 1:
+            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
         return topk_weights, topk_ids.to(torch.int32), out
 
     @staticmethod

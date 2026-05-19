@@ -24,6 +24,39 @@ from vllm_ascend.ops.triton.layernorm_gated import layer_norm_fwd_npu
 from vllm_ascend.utils import enable_custom_op, get_weight_prefetch_method
 
 
+def _is_unsupported_add_rms_norm_bias(error: RuntimeError) -> bool:
+    message = str(error)
+    return (
+        "AddRmsNormBias" in message
+        and ("does not support opType" in message or "Get regInfo failed" in message)
+    )
+
+
+def _npu_add_rms_norm_with_optional_bias(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    import torch_npu
+
+    if enable_custom_op():
+        try:
+            x, _, residual = torch.ops._C_ascend.npu_add_rms_norm_bias(
+                x, residual, weight, bias, eps
+            )
+            return x, residual
+        except RuntimeError as e:
+            if not _is_unsupported_add_rms_norm_bias(e):
+                raise
+
+    x, _, residual = torch_npu.npu_add_rms_norm(x, residual, weight, eps)
+    if bias is not None:
+        x.add_(bias)
+    return x, residual
+
+
 class AscendRMSNorm(RMSNorm):
     def __init__(
         self,
@@ -68,14 +101,9 @@ class AscendRMSNorm(RMSNorm):
 
         if residual is not None:
             residual = torch.ops.vllm.maybe_chunk_residual(x, residual)
-            if enable_custom_op():
-                x, _, residual = torch.ops._C_ascend.npu_add_rms_norm_bias(
-                    x, residual, self.weight, self.bias, self.variance_epsilon
-                )
-            else:
-                x, _, residual = torch_npu.npu_add_rms_norm(x, residual, self.weight, self.variance_epsilon)
-                if self.bias is not None:
-                    x.add_(self.bias)
+            x, residual = _npu_add_rms_norm_with_optional_bias(
+                x, residual, self.weight, self.bias, self.variance_epsilon
+            )
             return x, residual
 
         x, residual = torch_npu.npu_rms_norm(x, self.weight, self.variance_epsilon)
@@ -93,16 +121,11 @@ class AscendGemmaRMSNorm(GemmaRMSNorm):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        import torch_npu
-
         if residual is not None:
             residual = torch.ops.vllm.maybe_chunk_residual(x, residual)
-            if enable_custom_op():
-                x, _, residual = torch.ops._C_ascend.npu_add_rms_norm_bias(
-                    x, residual, 1.0 + self.weight, None, self.variance_epsilon
-                )
-            else:
-                x, _, residual = torch_npu.npu_add_rms_norm(x, residual, 1.0 + self.weight, self.variance_epsilon)
+            x, residual = _npu_add_rms_norm_with_optional_bias(
+                x, residual, 1.0 + self.weight, None, self.variance_epsilon
+            )
             return x, residual
 
         x, _ = torch.ops._C_ascend.npu_gemma_rms_norm(x, self.weight, self.variance_epsilon)
