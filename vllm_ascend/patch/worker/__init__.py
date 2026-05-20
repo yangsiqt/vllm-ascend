@@ -50,7 +50,9 @@ import vllm_ascend.patch.worker.patch_kimi_k25  # noqa
 import vllm_ascend.patch.worker.patch_draft_quarot  # noqa
 import vllm_ascend.patch.worker.patch_cudagraph  # noqa
 import vllm_ascend.patch.worker.patch_deepseek_mtp  # noqa
+import vllm_ascend.patch.worker.patch_ernie_mtp  # noqa
 import vllm_ascend.patch.worker.patch_gqa_c8  # noqa
+import vllm_ascend.patch.worker.patch_mimo_mtp  # noqa
 
 if _V2_MODEL_RUNNER_SUPPORTED:
     import vllm_ascend.patch.worker.patch_v2.patch_uva  # noqa
