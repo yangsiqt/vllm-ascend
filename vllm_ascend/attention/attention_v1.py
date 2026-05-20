@@ -23,6 +23,7 @@ import torch_npu
 import vllm.envs as envs_vllm
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
+from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import (  # type: ignore
     AttentionBackend,
@@ -396,6 +397,113 @@ class AscendAttentionBackendImpl(AttentionImpl):
         self.sinks = sinks
         self.layerIndex = 0
         self.enable_hamming_sparse = is_enable_hamming_sparse()
+
+    def _use_prefill_query_quantization(self) -> bool:
+        attention_config = getattr(self.vllm_config, "attention_config", None)
+        return getattr(attention_config, "use_prefill_query_quantization", False) is True
+
+    @staticmethod
+    def _is_prefill_state(attn_state: "AscendAttentionState") -> bool:
+        return attn_state in (
+            AscendAttentionState.PrefillNoCache,
+            AscendAttentionState.PrefillCacheHit,
+            AscendAttentionState.ChunkedPrefill,
+        )
+
+    def _warn_prefill_query_quantization_fallback(self, backend: str) -> None:
+        logger.warning_once(
+            "use_prefill_query_quantization is enabled, but %s does not support query quantization on Ascend yet; "
+            "fallback to the default prefill attention path.",
+            backend,
+        )
+
+    @staticmethod
+    def _per_tensor_int8_quant(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        scale = (x.abs().max().float() / 127.0).clamp(min=1.0e-8)
+        x_int8 = torch.clamp(torch.round(x.float() / scale), -127, 127).to(torch.int8)
+        return x_int8, scale.reshape(1)
+
+    @staticmethod
+    def _unflatten_prefill_tensor(x: torch.Tensor, seq_lens: list[int]) -> torch.Tensor:
+        batch_size = len(seq_lens)
+        max_seq_len = max(seq_lens)
+        padded = x.new_zeros((batch_size, max_seq_len, *x.shape[1:]))
+        start = 0
+        for idx, seq_len in enumerate(seq_lens):
+            end = start + seq_len
+            padded[idx, :seq_len] = x[start:end]
+            start = end
+        return padded
+
+    @staticmethod
+    def _flatten_prefill_tensor(x: torch.Tensor, seq_lens: list[int]) -> torch.Tensor:
+        return torch.cat([x[idx, :seq_len] for idx, seq_len in enumerate(seq_lens)], dim=0)
+
+    def _forward_prefill_query_quant_pfa(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AscendMetadata,
+    ) -> torch.Tensor | None:
+        if (
+            attn_metadata.attn_state != AscendAttentionState.PrefillNoCache
+            or self.attn_type == AttentionType.ENCODER_DECODER
+            or self.sliding_window is not None
+            or self.sinks is not None
+            or self.num_heads % self.num_kv_heads != 0
+        ):
+            return None
+
+        actual_seq_lengths = attn_metadata.actual_seq_lengths_q
+        if not actual_seq_lengths:
+            return None
+
+        cumulative_seq_lens = [int(seq_len) for seq_len in actual_seq_lengths]
+        seq_lens = [cumulative_seq_lens[0]] + [
+            cumulative_seq_lens[idx] - cumulative_seq_lens[idx - 1] for idx in range(1, len(cumulative_seq_lens))
+        ]
+        num_tokens = cumulative_seq_lens[-1]
+        query = query[:num_tokens]
+        key = key[:num_tokens]
+        value = value[:num_tokens]
+
+        padded_query = self._unflatten_prefill_tensor(query, seq_lens)
+        padded_key = self._unflatten_prefill_tensor(key, seq_lens)
+        padded_value = self._unflatten_prefill_tensor(value, seq_lens)
+
+        quant_query, query_scale = self._per_tensor_int8_quant(padded_query)
+        quant_key, key_scale = self._per_tensor_int8_quant(padded_key)
+        quant_value, value_scale = self._per_tensor_int8_quant(padded_value)
+
+        softmax_quant_scale = torch.tensor([127.0], dtype=torch.float32, device=query.device)
+        deq_scale1 = (query_scale * key_scale).to(torch.float32)
+        deq_scale2 = (value_scale / softmax_quant_scale).to(torch.float32)
+
+        attn_mask = None
+        if attn_metadata.causal:
+            max_seq_len = padded_query.shape[1]
+            attn_mask = torch.triu(
+                torch.ones(max_seq_len, max_seq_len, dtype=torch.uint8, device=query.device), diagonal=1
+            )
+
+        attn_output = torch_npu.npu_prompt_flash_attention(
+            quant_query,
+            quant_key,
+            quant_value,
+            atten_mask=attn_mask,
+            actual_seq_lengths=seq_lens,
+            actual_seq_lengths_kv=seq_lens,
+            deq_scale1=deq_scale1,
+            quant_scale1=softmax_quant_scale,
+            deq_scale2=deq_scale2,
+            num_heads=self.num_heads,
+            num_key_value_heads=self.num_kv_heads,
+            scale_value=self.scale,
+            input_layout="BSND",
+            sparse_mode=0,
+        )
+        return self._flatten_prefill_tensor(attn_output, seq_lens).view(num_tokens, self.num_heads, self.head_size)
 
     @staticmethod
     def update_graph_params(
@@ -884,6 +992,12 @@ class AscendAttentionBackendImpl(AttentionImpl):
         ):
             key = key[:num_tokens]
             value = value[:num_tokens]
+        if self._use_prefill_query_quantization() and self._is_prefill_state(attn_metadata.attn_state):
+            quantized_attn_output = self._forward_prefill_query_quant_pfa(query, key, value, attn_metadata)
+            if quantized_attn_output is not None:
+                output[:num_tokens] = quantized_attn_output[:num_tokens]
+                return output
+            self._warn_prefill_query_quantization_fallback("Ascend dense attention")
         # Get workspace from cache or calculate it if not present.
         if self.sinks is not None:
             actual_seq_qlen = attn_metadata.actual_seq_lengths_q
@@ -1388,6 +1502,9 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
         actual_seq_qlen = attn_metadata.actual_seq_lengths_q
         num_tokens = int(actual_seq_qlen[-1])  # type: ignore[index]
 
+        if self._use_prefill_query_quantization() and attn_metadata.num_prefills > 0:
+            self._warn_prefill_query_quantization_fallback("Ascend C8 chunked prefill attention")
+
         if num_decode_tokens > 0:
             num_block, block_size, _, _ = self.key_cache.shape  # type: ignore[attr-defined]
             assert block_size % 32 == 0, (
@@ -1488,6 +1605,9 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
         actual_seq_qlen = attn_metadata.actual_seq_lengths_q
         num_tokens = int(actual_seq_qlen[-1])  # type: ignore[index]
         query = query[:num_tokens]
+
+        if self._use_prefill_query_quantization():
+            self._warn_prefill_query_quantization_fallback("Ascend C8 prefill attention")
 
         if (
             attn_metadata.attn_state == AscendAttentionState.PrefillNoCache

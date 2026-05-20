@@ -1551,6 +1551,43 @@ class TestAscendMLAImpl(TestBase):
         self.assertEqual(result.shape[0], batch_size)
         self.assertEqual(result.shape[1], self.impl.num_heads * self.impl.v_head_dim)
 
+    @patch("vllm_ascend.attention.mla_v1.logger.warning_once")
+    @patch("torch_npu.npu_fused_infer_attention_score")
+    @patch("torch_npu.npu_fused_infer_attention_score_v2")
+    @patch("torch_npu.npu_dynamic_quant")
+    def test_forward_prefill_query_quantization_fallback(
+        self, mock_dynamic_quant, mock_fia_v2, mock_fia, mock_warning_once
+    ):
+        batch_size = 2
+        q_nope = torch.randn(batch_size, self.impl.num_heads, self.impl.qk_nope_head_dim)
+        q_pe = torch.randn(batch_size, self.impl.num_heads, self.impl.qk_rope_head_dim)
+        k_nope = torch.randn(batch_size, self.impl.num_heads, self.impl.qk_nope_head_dim)
+        k_pe = torch.randn(batch_size, self.impl.num_heads, self.impl.qk_rope_head_dim)
+        value = torch.randn(batch_size, self.impl.num_heads, self.impl.v_head_dim)
+        kv_c_and_k_pe_cache = [torch.randn(10, 1, 1, 192), torch.randn(10, 1, 1, 32)]
+
+        attn_metadata = MagicMock()
+        prefill_metadata = MagicMock()
+        prefill_metadata.actual_seq_lengths_q = [batch_size]
+        prefill_metadata.attn_mask = torch.randn(1, 1, batch_size, batch_size)
+        prefill_metadata.chunked_context = None
+        attn_metadata.prefill = prefill_metadata
+
+        self.impl.vllm_config.attention_config.use_prefill_query_quantization = True
+        mock_fia.return_value = (
+            torch.randn(batch_size, self.impl.num_heads, self.impl.v_head_dim, dtype=torch.bfloat16),
+            torch.randn(self.impl.num_heads, batch_size),
+        )
+
+        result = self.impl._forward_prefill(q_nope, q_pe, k_nope, k_pe, value, kv_c_and_k_pe_cache, attn_metadata)
+
+        mock_warning_once.assert_called_once()
+        mock_dynamic_quant.assert_not_called()
+        mock_fia_v2.assert_not_called()
+        mock_fia.assert_called_once()
+        self.assertEqual(result.shape[0], batch_size)
+        self.assertEqual(result.shape[1], self.impl.num_heads * self.impl.v_head_dim)
+
     @patch("torch_npu.npu_format_cast")
     def test_process_weights_after_loading(self, mock_format_cast):
         layer = MagicMock(spec=LinearBase)

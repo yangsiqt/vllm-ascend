@@ -236,6 +236,94 @@ class TestAscendAttentionBackendImpl(TestBase):
         mock_npu_fused_infer_attention_score.assert_called_once()
         assert output.shape == (10, 8, 64)
 
+    @patch("vllm_ascend.attention.attention_v1.logger.warning_once")
+    @patch("torch_npu._npu_reshape_and_cache")
+    @patch("torch_npu.npu_fused_infer_attention_score")
+    @patch("vllm_ascend.ascend_forward_context.get_forward_context")
+    def test_forward_fused_infer_attention_query_quantization_fallback(
+        self,
+        mock_get_forward_context,
+        mock_npu_fused_infer_attention_score,
+        mock_npu_reshape_and_cache,
+        mock_warning_once,
+    ):
+        query = torch.randn(10, 8, 64)
+        key = torch.randn(10, 8, 64)
+        value = torch.randn(10, 8, 64)
+        kv_cache = torch.empty(2, 5, 128, 8, 64)
+        output = torch.empty_like(query)
+        metadata = self.attn_metadata
+        metadata.attn_state = AscendAttentionState.PrefillCacheHit
+        metadata.attn_mask = torch.randn(1, 1, 10, 10)
+        metadata.seq_lens = torch.tensor([10])
+        metadata.actual_seq_lengths_q = [10]
+        metadata.block_tables = torch.zeros(1, 5, dtype=torch.long)
+        metadata.num_actual_tokens = 10
+        metadata.num_decode_tokens = 0
+        metadata.num_decodes = 0
+        metadata.num_prefills = 10
+        metadata.slot_mapping = torch.zeros(10, dtype=torch.long)
+        self.impl.vllm_config.attention_config.use_prefill_query_quantization = True
+
+        mock_get_forward_context.return_value = MagicMock(capturing=False)
+        mock_npu_fused_infer_attention_score.return_value = (torch.ones(10, 8, 64), torch.ones(10, 8, 64))
+
+        output = self.impl.forward(self.layer_no_quant, query, key, value, kv_cache, metadata, output)
+
+        mock_warning_once.assert_called_once()
+        mock_npu_fused_infer_attention_score.assert_called_once()
+        assert output.shape == (10, 8, 64)
+
+    @patch("vllm_ascend.attention.attention_v1.logger.warning_once")
+    @patch("torch_npu._npu_reshape_and_cache")
+    @patch("torch_npu.npu_fused_infer_attention_score")
+    @patch("torch_npu.npu_prompt_flash_attention")
+    @patch("vllm_ascend.ascend_forward_context.get_forward_context")
+    def test_forward_fused_infer_attention_query_quantization_prefill_no_cache(
+        self,
+        mock_get_forward_context,
+        mock_npu_prompt_flash_attention,
+        mock_npu_fused_infer_attention_score,
+        mock_npu_reshape_and_cache,
+        mock_warning_once,
+    ):
+        query = torch.randn(10, 8, 64)
+        key = torch.randn(10, 8, 64)
+        value = torch.randn(10, 8, 64)
+        kv_cache = torch.empty(2, 5, 128, 8, 64)
+        output = torch.empty_like(query)
+        metadata = self.attn_metadata
+        metadata.attn_state = AscendAttentionState.PrefillNoCache
+        metadata.attn_mask = torch.randn(1, 1, 10, 10)
+        metadata.seq_lens = torch.tensor([10])
+        metadata.seq_lens_list = [10]
+        metadata.actual_seq_lengths_q = [10]
+        metadata.block_tables = torch.zeros(1, 5, dtype=torch.long)
+        metadata.num_actual_tokens = 10
+        metadata.num_decode_tokens = 0
+        metadata.num_decodes = 0
+        metadata.num_prefills = 1
+        metadata.slot_mapping = torch.zeros(10, dtype=torch.long)
+        metadata.causal = True
+        self.impl.vllm_config.attention_config.use_prefill_query_quantization = True
+
+        mock_get_forward_context.return_value = MagicMock(capturing=False)
+        mock_npu_prompt_flash_attention.return_value = torch.ones(1, 10, 8, 64)
+
+        output = self.impl.forward(self.layer_no_quant, query, key, value, kv_cache, metadata, output)
+
+        mock_warning_once.assert_not_called()
+        mock_npu_prompt_flash_attention.assert_called_once()
+        mock_npu_fused_infer_attention_score.assert_not_called()
+        args, kwargs = mock_npu_prompt_flash_attention.call_args
+        assert args[0].dtype == torch.int8
+        assert args[1].dtype == torch.int8
+        assert args[2].dtype == torch.int8
+        assert kwargs["deq_scale1"].dtype == torch.float32
+        assert kwargs["quant_scale1"].dtype == torch.float32
+        assert kwargs["deq_scale2"].dtype == torch.float32
+        assert output.shape == (10, 8, 64)
+
     @patch("vllm_ascend.attention.attention_v1.using_paged_attention")
     @patch("torch_npu._npu_paged_attention")
     @patch("torch_npu._npu_reshape_and_cache")

@@ -770,6 +770,10 @@ class AscendMLAImpl(MLAAttentionImpl):
                 )
         register_all_layers_to_shard_weight_series(self.layer_sharding_kwargs)
 
+    def _use_prefill_query_quantization(self) -> bool:
+        attention_config = getattr(self.vllm_config, "attention_config", None)
+        return getattr(attention_config, "use_prefill_query_quantization", False) is True
+
     @staticmethod
     def update_graph_params(
         update_stream,
@@ -1134,6 +1138,12 @@ class AscendMLAImpl(MLAAttentionImpl):
         if prefill_metadata is None or prefill_metadata.chunked_context is None:
             return prefix_output, prefix_lse
 
+        if self._use_prefill_query_quantization():
+            logger.warning_once(
+                "use_prefill_query_quantization is not supported for MLA chunked prefill context on Ascend yet; "
+                "fallback to the default prefill attention path."
+            )
+
         iters = len(prefill_metadata.chunked_context.seq_tot)
         cache_kv_c = kv_c_and_k_pe_cache[0]
         cache_k_pe = kv_c_and_k_pe_cache[1]
@@ -1261,6 +1271,12 @@ class AscendMLAImpl(MLAAttentionImpl):
             "actual_seq_lengths": actual_seq_lengths_q,
             "actual_seq_lengths_kv": actual_seq_lengths_kv,
         }
+
+        if self._use_prefill_query_quantization():
+            logger.warning_once(
+                "use_prefill_query_quantization is enabled, but Ascend MLA prefill PFA does not support query "
+                "dequantization yet; fallback to the default prefill attention path."
+            )
 
         attn_output, attn_lse = torch_npu.npu_fused_infer_attention_score(q_nope, k_nope, value, **common_kwargs)
 
