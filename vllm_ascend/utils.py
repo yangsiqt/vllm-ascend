@@ -416,6 +416,18 @@ def enable_custom_op():
     return _CUSTOM_OP_ENABLED
 
 
+@lru_cache(maxsize=1)
+def enable_add_rms_norm_bias_custom_op():
+    """Return whether npu_add_rms_norm_bias can run on this Ascend target."""
+    if not enable_custom_op():
+        return False
+
+    # CANN 9.0.0 on Ascend 910B reports that AddRmsNormBias has no binary
+    # support for ascend910b. The A2 build targets the 910B-family devices in
+    # this environment, so keep this custom op out of compiled graphs there.
+    return get_ascend_device_type() != AscendDeviceType.A2
+
+
 def find_hccl_library() -> str:
     """
     We either use the library file specified by the `HCCL_SO_PATH`

@@ -22,7 +22,10 @@ from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm, RMSNormG
 
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.triton.layernorm_gated import layer_norm_fwd_npu
-from vllm_ascend.utils import enable_custom_op, get_weight_prefetch_method
+from vllm_ascend.utils import (
+    enable_add_rms_norm_bias_custom_op,
+    get_weight_prefetch_method,
+)
 
 
 class AscendRMSNorm(RMSNorm):
@@ -38,6 +41,7 @@ class AscendRMSNorm(RMSNorm):
         vllm_config = get_current_vllm_config()
         self.bias = None
         self.bias_loaded = False
+        self.enable_add_rms_norm_bias_custom_op = enable_add_rms_norm_bias_custom_op()
 
         # quantization with anti_method m4 will generate none-zero norm bias
         if vllm_config.quant_config is not None and any(
@@ -69,14 +73,14 @@ class AscendRMSNorm(RMSNorm):
 
         if residual is not None:
             residual = torch.ops.vllm.maybe_chunk_residual(x, residual)
-            if enable_custom_op():
+            if self.enable_add_rms_norm_bias_custom_op:
                 x, _, residual = torch.ops._C_ascend.npu_add_rms_norm_bias(
                     x, residual, self.weight, self.bias, self.variance_epsilon
                 )
             else:
                 x, _, residual = torch_npu.npu_add_rms_norm(x, residual, self.weight, self.variance_epsilon)
                 if self.bias is not None:
-                    x.add_(self.bias)
+                    x = x + self.bias
             return x, residual
 
         x, residual = torch_npu.npu_rms_norm(x, self.weight, self.variance_epsilon)
@@ -89,6 +93,10 @@ class AscendRMSNorm(RMSNorm):
 
 
 class AscendGemmaRMSNorm(GemmaRMSNorm):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.enable_add_rms_norm_bias_custom_op = enable_add_rms_norm_bias_custom_op()
+
     def forward_oot(
         self,
         x: torch.Tensor,
@@ -98,7 +106,7 @@ class AscendGemmaRMSNorm(GemmaRMSNorm):
 
         if residual is not None:
             residual = torch.ops.vllm.maybe_chunk_residual(x, residual)
-            if enable_custom_op():
+            if self.enable_add_rms_norm_bias_custom_op:
                 x, _, residual = torch.ops._C_ascend.npu_add_rms_norm_bias(
                     x, residual, 1.0 + self.weight, None, self.variance_epsilon
                 )
