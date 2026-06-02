@@ -17,7 +17,9 @@
 
 import torch
 import vllm
+from vllm.compilation.decorators import support_torch_compile
 from vllm.model_executor.models.mimo_mtp import MiMoMultiTokenPredictorLayer
+from vllm.model_executor.models.mimo_mtp import MiMoMTP
 
 
 class AscendMiMoMultiTokenPredictorLayer(MiMoMultiTokenPredictorLayer):
@@ -48,3 +50,4 @@ class AscendMiMoMultiTokenPredictorLayer(MiMoMultiTokenPredictorLayer):
 vllm.model_executor.models.mimo_mtp.MiMoMultiTokenPredictorLayer = (
     AscendMiMoMultiTokenPredictorLayer
 )
+vllm.model_executor.models.mimo_mtp.MiMoMTP = support_torch_compile(MiMoMTP)
