@@ -39,7 +39,7 @@ else:
     triton_q_rms = None  # type: ignore
 
 _MOE_INIT_ROUTING_CUSTOM_SUPPORTED = get_ascend_device_type() != AscendDeviceType.A2
-_MOE_GATING_TOPK_RENORM_SUPPORTED = get_ascend_device_type() != AscendDeviceType.A2
+_MOE_GATING_TOPK_RENORM_SUPPORTED: bool | None = None
 
 
 class BaseDeviceAdaptor:
@@ -105,26 +105,43 @@ class BaseDeviceAdaptor:
         eps: float = 1e-20,
         bias_opt: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # Some Ascend 910B CANN builds only support renorm=0 in MoeGatingTopK.
-        # Keep the fused top-k path and apply softmax top-k renormalization
-        # explicitly afterwards.
-        needs_renorm_fallback = (
-            norm_type == 0 and renorm == 1 and not _MOE_GATING_TOPK_RENORM_SUPPORTED
-        )
-        op_renorm = 0 if needs_renorm_fallback else renorm
-        topk_weights, topk_ids, out = torch.ops._C_ascend.moe_gating_top_k(
-            x,
-            k=k,
-            k_group=k_group,
-            group_count=group_count,
-            group_select_mode=group_select_mode,
-            renorm=op_renorm,
-            norm_type=norm_type,
-            out_flag=out_flag,
-            routed_scaling_factor=routed_scaling_factor,
-            eps=eps,
-            bias_opt=bias_opt,
-        )
+        global _MOE_GATING_TOPK_RENORM_SUPPORTED
+        needs_renorm_fallback = norm_type == 0 and renorm == 1
+        op_renorm = 0 if needs_renorm_fallback and _MOE_GATING_TOPK_RENORM_SUPPORTED is False else renorm
+        try:
+            topk_weights, topk_ids, out = torch.ops._C_ascend.moe_gating_top_k(
+                x,
+                k=k,
+                k_group=k_group,
+                group_count=group_count,
+                group_select_mode=group_select_mode,
+                renorm=op_renorm,
+                norm_type=norm_type,
+                out_flag=out_flag,
+                routed_scaling_factor=routed_scaling_factor,
+                eps=eps,
+                bias_opt=bias_opt,
+            )
+            if needs_renorm_fallback and op_renorm == 1:
+                _MOE_GATING_TOPK_RENORM_SUPPORTED = True
+                needs_renorm_fallback = False
+        except RuntimeError:
+            if not needs_renorm_fallback or _MOE_GATING_TOPK_RENORM_SUPPORTED is False:
+                raise
+            _MOE_GATING_TOPK_RENORM_SUPPORTED = False
+            topk_weights, topk_ids, out = torch.ops._C_ascend.moe_gating_top_k(
+                x,
+                k=k,
+                k_group=k_group,
+                group_count=group_count,
+                group_select_mode=group_select_mode,
+                renorm=0,
+                norm_type=norm_type,
+                out_flag=out_flag,
+                routed_scaling_factor=routed_scaling_factor,
+                eps=eps,
+                bias_opt=bias_opt,
+            )
         if needs_renorm_fallback:
             topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
         return topk_weights, topk_ids.to(torch.int32), out

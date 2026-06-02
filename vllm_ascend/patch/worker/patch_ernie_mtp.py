@@ -17,7 +17,9 @@
 
 import torch
 import vllm
+from vllm.compilation.decorators import support_torch_compile
 from vllm.model_executor.models.ernie_mtp import ErnieMultiTokenPredictorLayer
+from vllm.model_executor.models.ernie_mtp import ErnieMTP
 
 
 class AscendErnieMultiTokenPredictorLayer(ErnieMultiTokenPredictorLayer):
@@ -47,3 +49,4 @@ class AscendErnieMultiTokenPredictorLayer(ErnieMultiTokenPredictorLayer):
 vllm.model_executor.models.ernie_mtp.ErnieMultiTokenPredictorLayer = (
     AscendErnieMultiTokenPredictorLayer
 )
+vllm.model_executor.models.ernie_mtp.ErnieMTP = support_torch_compile(ErnieMTP)
